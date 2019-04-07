@@ -2,7 +2,11 @@ use std::env;
 
 #[derive(Debug, PartialEq)]
 enum Token {
-    Num(i64), // Number Literal
+    Num(i64),
+    Ident(String),
+
+    Assign,
+    Semicolon,
 
     Lparen,
     Rparen,
@@ -14,11 +18,17 @@ enum Token {
     EOF,
 }
 
+// enum NodeKind {
+//     Num(i64),
+//     Ident(String),
+// }
+
 #[derive(Debug)]
 struct Node {
     token: Token,
     lhs: Option<Box<Node>>,
     rhs: Option<Box<Node>>,
+    name: String,
 }
 
 impl Node {
@@ -27,14 +37,26 @@ impl Node {
             token,
             lhs: Some(Box::new(lhs)),
             rhs: Some(Box::new(rhs)),
+            name: String::from(""),
         }
     }
 
-    fn new_node_num(token: Token) -> Node {
+    fn new_node_num(num: i64) -> Node {
         Node {
-            token,
+            token: Token::Num(num),
             lhs: None,
             rhs: None,
+            name: String::from(""),
+        }
+    }
+
+    fn new_node_ident(name: &str) -> Node {
+        let name = name.to_string();
+        Node {
+            token: Token::Ident(name),
+            lhs: None,
+            rhs: None,
+            name: String::from(""),
         }
     }
 }
@@ -69,6 +91,16 @@ fn tokenize(p: &mut &str) -> Vec<Token> {
             }
 
             match b {
+                b'=' => {
+                    tokens.push(Token::Assign);
+                    *p = &p[1..];
+                    continue;
+                }
+                b';' => {
+                    tokens.push(Token::Semicolon);
+                    *p = &p[1..];
+                    continue;
+                }
                 b'+' => {
                     tokens.push(Token::Plus);
                     *p = &p[1..];
@@ -99,7 +131,13 @@ fn tokenize(p: &mut &str) -> Vec<Token> {
                     *p = &p[1..];
                     continue;
                 }
+                b'a'...b'z' => {
+                    tokens.push(Token::Ident((b as char).to_string()));
+                    *p = &p[1..];
+                    continue;
+                }
                 b'0'...b'9' => {
+                    // strtonum で p をすすめるので p の書き換えはここでは不要
                     tokens.push(Token::Num(strtonum(p)));
                     continue;
                 }
@@ -172,7 +210,11 @@ fn term(tokens: &mut Vec<Token>, pos: &mut usize) -> Node {
     match tokens[*pos] {
         Token::Num(num) => {
             *pos += 1;
-            return Node::new_node_num(Token::Num(num));
+            return Node::new_node_num(num);
+        }
+        Token::Ident(ref name) => {
+            *pos += 1;
+            return Node::new_node_ident(name);
         }
         _ => {}
     }
@@ -183,11 +225,40 @@ fn term(tokens: &mut Vec<Token>, pos: &mut usize) -> Node {
     );
 }
 
+fn gen_lval(node: Node) {
+    let name = match node.token {
+        Token::Ident(name) => name,
+        _ => panic!("代入の左辺値が変数ではありません"),
+    };
+
+    let offset = (b'z' - name.as_bytes()[0] + 1) * 8;
+    println!("  mov rax, rbp");
+    println!("  sub rax, {}", offset);
+    println!("  push rax");
+}
+
 /// x86-64 のスタック操作命令でスタックマシンをエミュレート
 fn gen(node: Node) {
     match node.token {
         Token::Num(num) => {
             println!("  push {}", num);
+            return;
+        }
+        Token::Ident(_) => {
+            gen_lval(node);
+            println!("  pop rax");
+            println!("  mov rax, [rax]");
+            println!("  push rax");
+            return;
+        }
+        Token::Assign => {
+            gen_lval(*node.lhs.unwrap());
+            gen(*node.rhs.unwrap());
+
+            println!("  pop rdi");
+            println!("  pop rax");
+            println!("  mov [rax], rdi");
+            println!("  push rdi");
             return;
         }
         _ => {}
@@ -213,6 +284,30 @@ fn gen(node: Node) {
     println!("  push rax");
 }
 
+fn program(tokens: &mut Vec<Token>, pos: &mut usize) -> Vec<Node> {
+    let mut code: Vec<Node> = vec![];
+    while tokens[*pos] != Token::EOF {
+        code.push(stmt(tokens, pos));
+    }
+    code
+}
+
+fn stmt(tokens: &mut Vec<Token>, pos: &mut usize) -> Node {
+    let node = assign(tokens, pos);
+    if !consume(tokens, Token::Semicolon, pos) {
+        panic!("';'ではないトークンです: {:?}", tokens[*pos]);
+    }
+    node
+}
+
+fn assign(tokens: &mut Vec<Token>, pos: &mut usize) -> Node {
+    let mut node = add(tokens, pos);
+    while consume(tokens, Token::Assign, pos) {
+        node = Node::new(Token::Assign, node, assign(tokens, pos));
+    }
+    node
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
@@ -221,19 +316,35 @@ fn main() {
 
     let mut p: &str = &args[1];
 
+    // トークナイズしてパースする
+    // 結果は code に保存される
     let mut tokens = tokenize(&mut p);
     let mut pos = 0;
-    let node = add(&mut tokens, &mut pos);
+    let code: Vec<Node> = program(&mut tokens, &mut pos);
 
     // アセンブリの前半部分を出力
     println!(".intel_syntax noprefix");
     println!(".global _main");
     println!("_main:");
 
-    // 抽象構文木を下りながらコード生成
-    gen(node);
+    // プロローグ
+    // 変数26個分の領域を確保する
+    println!("  push rbp");
+    println!("  mov rbp, rsp");
+    println!("  sub rsp, 208");
 
-    // スタックトップに残っているはずの式全体の値を rax にロードして関数の返り値とする
-    println!("  pop rax");
+    // 先頭の式から順にコードに変換
+    for c in code {
+        gen(c);
+
+        // 式の評価結果としてスタックに1つの値が残っているはずなので
+        // スタックが溢れないようにポップしておく
+        println!("  pop rax");
+    }
+
+    // エピローグ
+    // 最後の式の結果が RAX に残っているのでそれが返り値になる
+    println!("  mov rsp, rbp");
+    println!("  pop rbp");
     println!("  ret");
 }
